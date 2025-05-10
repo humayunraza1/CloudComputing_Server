@@ -16,7 +16,7 @@ const app = express();
 
 // Middleware
 app.use(cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: 'https://cloud-computing-shop-g4ecerh0byhtecdv.southeastasia-01.azurewebsites.net',
     credentials: true
 }));
 app.use(express.json());
@@ -273,34 +273,30 @@ app.post('/api/products', async (req, res) => {
     }
 });
 
-// Order tracking (public route)
 app.get('/api/trackorder/:id', async (req, res) => {
-    try {
-        const pool = await sql.connect(dbConfig);
-        const result = await pool.request()
-            .input('id', sql.Int, req.params.id)
-            .query(`
-                SELECT 
-                    order_id,
-                    destination_city,
-                    order_date,
-                    status,
-                    tracking_number,
-                    estimated_delivery
-                FROM Orders 
-                WHERE order_id = @id
-            `);
-        
-        if (result.recordset.length === 0) {
-            return res.status(404).json({ error: 'Order not found' });
-        }
-        
-        res.json(result.recordset[0]);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+  try {
+      const pool = await sql.connect(dbConfig);
+      const result = await pool.request()
+          .input('id', sql.VarChar, req.params.id)  // Changed from sql.Int to sql.VarChar
+          .query(`
+              SELECT 
+                  id as order_id,
+                  created_at as order_date,
+                  status
+              FROM Orders 
+              WHERE tracking_id = @id
+          `);
+      
+      if (result.recordset.length === 0) {
+          return res.status(404).json({ error: 'Order not found' });
+      }
+      
+      res.json(result.recordset[0]);
+  } catch (err) {
+      console.log(err);
+      res.status(500).json({ error: err.message });
+  }
 });
-
 // Get all orders (Admin/Editor only)
 app.get('/api/orders', authenticate, checkRole(['Admin', 'Editor']), async (req, res) => {
     try {
@@ -570,8 +566,17 @@ app.post('/api/categories/:categoryId/subcategories', async (req, res) => {
 app.post('/api/orders', async (req, res) => {
   try {
     const { name, address, phone, user_id, total_amount, items } = req.body;
-    if (!name || !address || !phone || !total_amount || !Array.isArray(items) || items.length === 0) {
+    
+    // Validate required fields
+    if (!total_amount || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'Missing required order fields' });
+    }
+
+    // Validate user info - either user_id OR guest info must be present
+    if (!user_id && (!name || !address || !phone)) {
+      return res.status(400).json({ 
+        error: 'For guest checkout, name, address, and phone are required' 
+      });
     }
 
     // Generate tracking_id as userId-YYYYMMDDHHmmss
@@ -614,7 +619,7 @@ app.post('/api/orders', async (req, res) => {
       
       // Insert order
       const orderResult = await new sql.Request(transaction)
-        .input('user_id', sql.Int, user_id)
+        .input('user_id', user_id ? sql.Int : sql.NVarChar, user_id || null)
         .input('total_amount', sql.Decimal(10,2), total_amount)
         .input('status', sql.VarChar(50), 'pending')
         .input('name', sql.VarChar(255), name)
@@ -641,13 +646,10 @@ app.post('/api/orders', async (req, res) => {
             VALUES (@order_id, @product_id, @quantity, @price)
           `);
         
-        // Get current quantity to check if it will become zero
+        // Update stock quantity
         const currentStockResult = await new sql.Request(transaction)
           .input('id', sql.Int, item.product_id)
-          .query(`
-            SELECT quantity FROM Products 
-            WHERE id = @id
-          `);
+          .query(`SELECT quantity FROM Products WHERE id = @id`);
         
         const currentQuantity = currentStockResult.recordset[0].quantity;
         const newQuantity = currentQuantity - item.quantity;
@@ -669,7 +671,12 @@ app.post('/api/orders', async (req, res) => {
       // Commit the transaction
       await transaction.commit();
       
-      res.status(201).json({ message: 'Order placed successfully', order_id, tracking_id });
+      res.status(201).json({ 
+        message: 'Order placed successfully', 
+        order_id, 
+        tracking_id,
+        is_guest: !user_id
+      });
     } catch (err) {
       // Rollback transaction if there's an error
       await transaction.rollback();
@@ -678,12 +685,11 @@ app.post('/api/orders', async (req, res) => {
   } catch (err) {
     console.error('Order placement error:', err);
     
-    // Return a more specific error message to the client
     if (err.message && err.message.includes('Not enough stock')) {
       return res.status(400).json({ error: err.message });
     }
     
-    res.status(500).json({ error: 'Failed to place order' });
+    res.status(500).json({ error: 'Failed to place order', details: err.message });
   }
 });
 
